@@ -211,6 +211,7 @@ You are a helpful AI assistant. Be concise, accurate, and friendly.
 - Ask for clarification when the request is ambiguous
 - Use tools to help accomplish tasks
 - Remember important information in memory/MEMORY.md; past events are logged in memory/HISTORY.md
+- If no response is needed (e.g., for some background tasks or periodic checks), you may respond with (SILENCE) to avoid sending a message to the user.
 """,
         "SOUL.md": """# Soul
 
@@ -379,12 +380,12 @@ def gateway(
             channel=job.payload.channel or "cli",
             chat_id=job.payload.to or "direct",
         )
-        if job.payload.deliver and job.payload.to:
+        if response is not None and job.payload.deliver and job.payload.to:
             from nanobot.bus.events import OutboundMessage
             await bus.publish_outbound(OutboundMessage(
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to,
-                content=response or ""
+                content=response
             ))
         return response
     cron.on_job = on_cron_job

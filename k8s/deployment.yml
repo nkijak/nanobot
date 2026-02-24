@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nanobot-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nanobot
+  labels:
+    app: nanobot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nanobot
+  template:
+    metadata:
+      labels:
+        app: nanobot
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: blackbox
+      containers:
+        - name: nanobot
+          image: registry.kinnack.com/nanobot:latest
+          args: ["gateway"]
+          ports:
+            - containerPort: 18790
+              name: gateway
+          volumeMounts:
+            - name: data
+              mountPath: /root/.nanobot
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: nanobot-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nanobot
+spec:
+  selector:
+    app: nanobot
+  ports:
+    - protocol: TCP
+      port: 18790
+      targetPort: 18790
+  type: ClusterIP
