@@ -563,16 +563,6 @@ def gateway(
             f"Task '{job.name}' has been triggered.\n"
             f"Scheduled instruction: {job.payload.message}"
         )
-<<<<<<< HEAD
-        if response is not None and job.payload.deliver and job.payload.to:
-            from nanobot.bus.events import OutboundMessage
-            await bus.publish_outbound(OutboundMessage(
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to,
-                content=response
-            ))
-=======
-
         cron_tool = agent.tools.get("cron")
         cron_token = None
         if isinstance(cron_tool, CronTool):
@@ -605,7 +595,6 @@ def gateway(
                     chat_id=job.payload.to,
                     content=response,
                 ))
->>>>>>> upstream/main
         return response
     cron.on_job = on_cron_job
 
