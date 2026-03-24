@@ -1,12 +1,13 @@
 from email.message import EmailMessage
 from datetime import date
+import imaplib
 
 import pytest
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.email import EmailChannel
-from nanobot.config.schema import EmailConfig
+from nanobot.channels.email import EmailConfig
 
 
 def _make_config() -> EmailConfig:
@@ -80,6 +81,120 @@ def test_fetch_new_messages_parses_unseen_and_marks_seen(monkeypatch) -> None:
     # Same UID should be deduped in-process.
     items_again = channel._fetch_new_messages()
     assert items_again == []
+
+
+def test_fetch_new_messages_retries_once_when_imap_connection_goes_stale(monkeypatch) -> None:
+    raw = _make_raw_email(subject="Invoice", body="Please pay")
+    fail_once = {"pending": True}
+
+    class FlakyIMAP:
+        def __init__(self) -> None:
+            self.store_calls: list[tuple[bytes, str, str]] = []
+            self.search_calls = 0
+
+        def login(self, _user: str, _pw: str):
+            return "OK", [b"logged in"]
+
+        def select(self, _mailbox: str):
+            return "OK", [b"1"]
+
+        def search(self, *_args):
+            self.search_calls += 1
+            if fail_once["pending"]:
+                fail_once["pending"] = False
+                raise imaplib.IMAP4.abort("socket error")
+            return "OK", [b"1"]
+
+        def fetch(self, _imap_id: bytes, _parts: str):
+            return "OK", [(b"1 (UID 123 BODY[] {200})", raw), b")"]
+
+        def store(self, imap_id: bytes, op: str, flags: str):
+            self.store_calls.append((imap_id, op, flags))
+            return "OK", [b""]
+
+        def logout(self):
+            return "BYE", [b""]
+
+    fake_instances: list[FlakyIMAP] = []
+
+    def _factory(_host: str, _port: int):
+        instance = FlakyIMAP()
+        fake_instances.append(instance)
+        return instance
+
+    monkeypatch.setattr("nanobot.channels.email.imaplib.IMAP4_SSL", _factory)
+
+    channel = EmailChannel(_make_config(), MessageBus())
+    items = channel._fetch_new_messages()
+
+    assert len(items) == 1
+    assert len(fake_instances) == 2
+    assert fake_instances[0].search_calls == 1
+    assert fake_instances[1].search_calls == 1
+
+
+def test_fetch_new_messages_keeps_messages_collected_before_stale_retry(monkeypatch) -> None:
+    raw_first = _make_raw_email(subject="First", body="First body")
+    raw_second = _make_raw_email(subject="Second", body="Second body")
+    mailbox_state = {
+        b"1": {"uid": b"123", "raw": raw_first, "seen": False},
+        b"2": {"uid": b"124", "raw": raw_second, "seen": False},
+    }
+    fail_once = {"pending": True}
+
+    class FlakyIMAP:
+        def login(self, _user: str, _pw: str):
+            return "OK", [b"logged in"]
+
+        def select(self, _mailbox: str):
+            return "OK", [b"2"]
+
+        def search(self, *_args):
+            unseen_ids = [imap_id for imap_id, item in mailbox_state.items() if not item["seen"]]
+            return "OK", [b" ".join(unseen_ids)]
+
+        def fetch(self, imap_id: bytes, _parts: str):
+            if imap_id == b"2" and fail_once["pending"]:
+                fail_once["pending"] = False
+                raise imaplib.IMAP4.abort("socket error")
+            item = mailbox_state[imap_id]
+            header = b"%s (UID %s BODY[] {200})" % (imap_id, item["uid"])
+            return "OK", [(header, item["raw"]), b")"]
+
+        def store(self, imap_id: bytes, _op: str, _flags: str):
+            mailbox_state[imap_id]["seen"] = True
+            return "OK", [b""]
+
+        def logout(self):
+            return "BYE", [b""]
+
+    monkeypatch.setattr("nanobot.channels.email.imaplib.IMAP4_SSL", lambda _h, _p: FlakyIMAP())
+
+    channel = EmailChannel(_make_config(), MessageBus())
+    items = channel._fetch_new_messages()
+
+    assert [item["subject"] for item in items] == ["First", "Second"]
+
+
+def test_fetch_new_messages_skips_missing_mailbox(monkeypatch) -> None:
+    class MissingMailboxIMAP:
+        def login(self, _user: str, _pw: str):
+            return "OK", [b"logged in"]
+
+        def select(self, _mailbox: str):
+            raise imaplib.IMAP4.error("Mailbox doesn't exist")
+
+        def logout(self):
+            return "BYE", [b""]
+
+    monkeypatch.setattr(
+        "nanobot.channels.email.imaplib.IMAP4_SSL",
+        lambda _h, _p: MissingMailboxIMAP(),
+    )
+
+    channel = EmailChannel(_make_config(), MessageBus())
+
+    assert channel._fetch_new_messages() == []
 
 
 def test_extract_text_body_falls_back_to_html() -> None:
@@ -169,7 +284,8 @@ async def test_send_uses_smtp_and_reply_subject(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_skips_when_auto_reply_disabled(monkeypatch) -> None:
+async def test_send_skips_reply_when_auto_reply_disabled(monkeypatch) -> None:
+    """When auto_reply_enabled=False, replies should be skipped but proactive sends allowed."""
     class FakeSMTP:
         def __init__(self, _host: str, _port: int, timeout: int = 30) -> None:
             self.sent_messages: list[EmailMessage] = []
@@ -201,6 +317,11 @@ async def test_send_skips_when_auto_reply_disabled(monkeypatch) -> None:
     cfg = _make_config()
     cfg.auto_reply_enabled = False
     channel = EmailChannel(cfg, MessageBus())
+
+    # Mark alice as someone who sent us an email (making this a "reply")
+    channel._last_subject_by_chat["alice@example.com"] = "Previous email"
+
+    # Reply should be skipped (auto_reply_enabled=False)
     await channel.send(
         OutboundMessage(
             channel="email",
@@ -210,6 +331,7 @@ async def test_send_skips_when_auto_reply_disabled(monkeypatch) -> None:
     )
     assert fake_instances == []
 
+    # Reply with force_send=True should be sent
     await channel.send(
         OutboundMessage(
             channel="email",
@@ -220,6 +342,56 @@ async def test_send_skips_when_auto_reply_disabled(monkeypatch) -> None:
     )
     assert len(fake_instances) == 1
     assert len(fake_instances[0].sent_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_send_proactive_email_when_auto_reply_disabled(monkeypatch) -> None:
+    """Proactive emails (not replies) should be sent even when auto_reply_enabled=False."""
+    class FakeSMTP:
+        def __init__(self, _host: str, _port: int, timeout: int = 30) -> None:
+            self.sent_messages: list[EmailMessage] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def starttls(self, context=None):
+            return None
+
+        def login(self, _user: str, _pw: str):
+            return None
+
+        def send_message(self, msg: EmailMessage):
+            self.sent_messages.append(msg)
+
+    fake_instances: list[FakeSMTP] = []
+
+    def _smtp_factory(host: str, port: int, timeout: int = 30):
+        instance = FakeSMTP(host, port, timeout=timeout)
+        fake_instances.append(instance)
+        return instance
+
+    monkeypatch.setattr("nanobot.channels.email.smtplib.SMTP", _smtp_factory)
+
+    cfg = _make_config()
+    cfg.auto_reply_enabled = False
+    channel = EmailChannel(cfg, MessageBus())
+
+    # bob@example.com has never sent us an email (proactive send)
+    # This should be sent even with auto_reply_enabled=False
+    await channel.send(
+        OutboundMessage(
+            channel="email",
+            chat_id="bob@example.com",
+            content="Hello, this is a proactive email.",
+        )
+    )
+    assert len(fake_instances) == 1
+    assert len(fake_instances[0].sent_messages) == 1
+    sent = fake_instances[0].sent_messages[0]
+    assert sent["To"] == "bob@example.com"
 
 
 @pytest.mark.asyncio
